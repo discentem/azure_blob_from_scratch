@@ -11,8 +11,6 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/google/logger"
-
 	retry "github.com/avast/retry-go"
 )
 
@@ -82,7 +80,7 @@ func (c *graphClient) Post(url string, body io.Reader) (resp *http.Response, err
 // and finally calling graphClient.Do()
 func (c *graphClient) GetBlob(container, blob string) (*http.Response, error) {
 	uri := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", storageAccount, container, blob)
-	logger.Infof("requesting %s", uri)
+	log.Printf("requesting %s", uri)
 	req, err := http.NewRequest("GET", uri, nil)
 	if err != nil {
 		return nil, err
@@ -249,10 +247,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	resp, err := c.GetBlob(blobContainer, "azureblobtest")
+	resp, err := c.GetBlob(blobContainer, blobName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	b, _ := ioutil.ReadAll(resp.Body)
+	fmt.Printf("Printing contents of %s\n", blobName)
 	fmt.Println(string(b))
 }
