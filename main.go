@@ -1,18 +1,82 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/StackExchange/wmi"
 	retry "github.com/avast/retry-go"
 )
+
+var (
+	// ErrWMIEmptyResult indicates a condition where WMI failed to return the expected values.
+	ErrWMIEmptyResult = errors.New("WMI returned without error, but zero results")
+)
+
+type Win32_Bios struct {
+	SerialNumber string
+}
+
+func Win32Bios() (*Win32_Bios, error) {
+	var result []Win32_Bios
+	if err := wmi.Query(wmi.CreateQuery(&result, ""), &result); err != nil {
+		return nil, err
+	}
+	if len(result) < 1 {
+		return nil, ErrWMIEmptyResult
+	}
+	return &result[0], nil
+}
+
+type Win32_ComputerSystem struct {
+	DNSHostName  string
+	Domain       string
+	DomainRole   int
+	Model        string
+	Manufacturer string
+}
+
+func Win32CompSys() (*Win32_ComputerSystem, error) {
+	var result []Win32_ComputerSystem
+	if err := wmi.Query(wmi.CreateQuery(&result, ""), &result); err != nil {
+		return nil, err
+	}
+	if len(result) < 1 {
+		return nil, ErrWMIEmptyResult
+	}
+	return &result[0], nil
+}
+
+type MDM_DevDetail_Ext01 struct {
+	DeviceHardwareData string
+}
+
+func MDMDevDetail() (*MDM_DevDetail_Ext01, error) {
+	var result []MDM_DevDetail_Ext01
+	if err := wmi.QueryNamespace(wmi.CreateQuery(&result, ""), &result, "root/cimv2/mdm/dmmap"); err != nil {
+		return nil, err
+	}
+	if len(result) < 1 {
+		return nil, ErrWMIEmptyResult
+	}
+	return &result[0], nil
+}
+
+type autopilotReq struct {
+	Manufacturer       string
+	Model              string
+	SerialNumber       string
+	DeviceHardwareData string
+}
 
 // WrappedToken is Token with a better expiration field
 type WrappedToken struct {
@@ -65,17 +129,6 @@ func (c *graphClient) Get(url string) (*http.Response, error) {
 	return c.Do(req)
 }
 
-// Get crafts a http POST request and calls graphClient.Do() to execute
-func (c *graphClient) Post(url string, body io.Reader) (resp *http.Response, err error) {
-	req, err := http.NewRequest("POST", url, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	return c.Do(req)
-}
-
 // GetBlob retrieves a blob from Azure Blob container by providing required headers
 // and finally calling graphClient.Do()
 func (c *graphClient) GetBlob(container, blob string) (*http.Response, error) {
@@ -89,6 +142,45 @@ func (c *graphClient) GetBlob(container, blob string) (*http.Response, error) {
 	uts := time.Now().UTC().Format(http.TimeFormat)
 	req.Header.Add("Date", uts)
 	return c.Do(req)
+}
+
+type AutopilotState struct {
+	ODataType            string `json:"@odata.type"`
+	DeviceImportStatus   string `json:"deviceImportStatus"`
+	DeviceRegistrationID string `json:"deviceRegistrationId"`
+	DeviceErrorCode      int    `json:"deviceErrorCode"`
+	DeviceErrorName      string `json:"deviceErrorName"`
+}
+
+func (c *graphClient) RegisterAutopilotDevice(apr autopilotReq) error {
+	data, err := json.Marshal(struct {
+		ODataType         string         `json:"@odata.type"`
+		SerialNumber      string         `json:"serialNumber"`
+		HardwareIdentifer string         `json:"hardwareIdentifier"`
+		State             AutopilotState `json:"state"`
+	}{
+		ODataType:         "#microsoft.graph.importedWindowsAutopilotDeviceIdentity",
+		SerialNumber:      apr.SerialNumber,
+		HardwareIdentifer: apr.DeviceHardwareData,
+		State: AutopilotState{
+			ODataType:          "microsoft.graph.importedWindowsAutopilotDeviceIdentityState",
+			DeviceImportStatus: "pending",
+			DeviceErrorCode:    0,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequest("POST", "https://graph.microsoft.com/v1.0/deviceManagement/importedWindowsAutopilotDeviceIdentities/", bytes.NewBuffer(data))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Do(req)
+	body, _ := ioutil.ReadAll(resp.Body)
+	fmt.Println(resp.StatusCode)
+	fmt.Println(resp.Status)
+	fmt.Println(string(body))
+	return nil
+
 }
 
 // Do adds the access token to Authorization header before calling graphClient.c.Do()
@@ -196,6 +288,7 @@ func deviceCodeFlow(timeout time.Duration) (*graphClient, error) {
 			if err := json.Unmarshal(b, &dcpe); err != nil {
 				return err
 			}
+			fmt.Println(dcpe)
 			// https://docs.microsoft.com/en-us/azure/active-directory/develop/v2-oauth2-device-code#device-authorization-request
 			switch dcpe.Error {
 			case "authorization_pending":
@@ -225,7 +318,7 @@ func deviceCodeFlow(timeout time.Duration) (*graphClient, error) {
 			return nil
 		},
 		retry.Delay(delayPerAttempt),
-		retry.Attempts(uint(timeout.Seconds())/uint(delayPerAttempt.Seconds())),
+		retry.Attempts(uint(50)),
 		// FixedDelay instead of exponential backoff
 		retry.DelayType(retry.FixedDelay),
 		// Only retry if auth is pending. All other errors are hopeless.
@@ -247,11 +340,41 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	resp, err := c.GetBlob(blobContainer, blobName)
+	// resp, err := c.GetBlob(blobContainer, blobName)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// b, _ := ioutil.ReadAll(resp.Body)
+	// fmt.Printf("Printing contents of %s\n", blobName)
+	// fmt.Println(string(b))
+
+	apr := autopilotReq{}
+
+	cs, err := Win32CompSys()
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println(err)
+		os.Exit(1)
 	}
-	b, _ := ioutil.ReadAll(resp.Body)
-	fmt.Printf("Printing contents of %s\n", blobName)
-	fmt.Println(string(b))
+	apr.Manufacturer = strings.TrimSpace(cs.Manufacturer)
+	apr.Model = strings.TrimSpace(cs.Model)
+
+	bios, err := Win32Bios()
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	apr.SerialNumber = bios.SerialNumber
+
+	mdmInfo, err := MDMDevDetail()
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	apr.DeviceHardwareData = mdmInfo.DeviceHardwareData
+	fmt.Println(apr)
+
+	if err := c.RegisterAutopilotDevice(apr); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }
